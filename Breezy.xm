@@ -530,7 +530,7 @@ static BOOL isPayloadBlessed(NSDictionary *payload, NSString *expectedEntitlemen
         NSString *cancelButtonTitle = nil;
         if ([supportedApplications count] == 0) {
             // No apps support opening the files
-            if ([files count] == 1) {
+            if ([allItems count] <= 1) {
                 // No apps can open the provided file
                 alertBodyText = [NSString stringWithFormat:@"No applications support opening \"%@\".", itemNames];
             }
@@ -545,7 +545,7 @@ static BOOL isPayloadBlessed(NSDictionary *payload, NSString *expectedEntitlemen
                 }
                 else {
                     // None of the provided files had an app that supports them
-                    alertBodyText = [NSString stringWithFormat:@"No application supports opening the provided %@.", itemName];
+                    alertBodyText = [NSString stringWithFormat:@"No application supports opening the provided %@s.", itemName];
                 }
             }
             cancelButtonTitle = @"OK";
