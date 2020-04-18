@@ -243,46 +243,101 @@ static BOOL isPayloadBlessed(NSDictionary *payload, NSString *expectedEntitlemen
 
 %group PineBoard
 
-%hook PBAppDelegate
-
+%hook LSApplicationWorkspace
 /*
- 
  the Breezy preferences (/var/mobile/Library/Preferences/com.nito.Breezy.plist) track whether or not
  AirDrop is on AND whether or not applications will 'mimic' another to shoe-horn in AirDrop support
  utilizing code injection rather than editing a file on device.
  
  In this default example we add VLC to mimic Ethereal's AirDrop advertising settings, that means
  any file that Ethereal can open, VLC will claim it can open as well!
- 
  */
 
-%new - (NSArray *) updatedApplicationsWithMimes:(NSArray *)original {
-    __block NSMutableArray *newApps = [original mutableCopy];
-    NSDictionary *appMimicMap = [self appMimicMap];
-    if (appMimicMap == nil){
+// Allow apps to support file extensions they don't usually work with
+- (NSArray *)applicationsAvailableForOpeningDocument:(id)documentProxy {
+    NSMutableArray *availableApplications = [(NSArray *)%orig mutableCopy];
+
+    // Specify specific extensions that will be handled by new apps
+    // Key: File extension
+    // Value: list of (new) applications that can open the file
+    NSDictionary *customExtensionMappings = @{
+        @"ipa": @[@"com.matchstic.reprovision.tvos"]
+    };
+    
+    NSString *documentExtension = [[documentProxy valueForKey:@"_name"] pathExtension];
+    for (NSString *extension in customExtensionMappings) {
+        if ([extension isEqualToString:documentExtension]) {
+            // Document extension matches one of the custom extension mappings
+            // Update the available applications to include the custom items
+            for (NSString *customAppIdentifier in customExtensionMappings[extension]) {
+                id customApplication = [LSApplicationProxy applicationProxyForIdentifier:customAppIdentifier];
+                // Confirm its installed
+                if ([customApplication localizedName]) {
+                    [availableApplications addObject:customApplication];
+                }
+            }
+        }
+    }
+
+    // Allow an app to impersonate another application's supported extensions (VLC will support everything Ethereal supports)
+    // Key: Application to impersonate
+    // Value: list of applications that will impersonate the key application's extension support
+    NSDictionary *impersonationMappings = [self appMimicMap];
+    if (impersonationMappings == nil) {
         //setup default
-        appMimicMap = @{@"com.nito.Ethereal":@[@"org.videolan.vlc-ios"]};
-        [[self breezyPreferences] setObject:appMimicMap forKey:@"appMimicMap"];
+        impersonationMappings = @{
+            @"com.nito.Ethereal": @[@"org.videolan.vlc-ios"]
+        };
+        [[self breezyPreferences] setObject:impersonationMappings forKey:@"appMimicMap"];
         [[self breezyPreferences] synchronize];
     }
-    [original enumerateObjectsUsingBlock:^(LSApplicationProxy *application, NSUInteger idx, BOOL * _Nonnull stop){
-        NSString *bundleID = [application bundleIdentifier];
-        if ([[appMimicMap allKeys] containsObject:bundleID]){
-            id apps = [appMimicMap objectForKey:bundleID];
-            [apps enumerateObjectsUsingBlock:^(id obj, NSUInteger appIdx, BOOL * _Nonnull stopA) {
-               id foundProx = [LSApplicationProxy applicationProxyForIdentifier:obj];
-               if (foundProx){
-                    HBLogDebug(@"found application: %@", foundProx);
-                   if (![newApps containsObject:foundProx]){
-                       [newApps addObject:foundProx];
-                       
-                   }
-               }
-            }];
+
+    int availableAppsCount = [availableApplications count];
+    for (int i = 0; i < availableAppsCount; i++) {
+        // If the mapping contains the identifier of an app that legitimately supports this document
+        NSString *applicationIdentifier = [availableApplications[i] valueForKey:@"_bundleIdentifier"];
+        if ([impersonationMappings valueForKey:applicationIdentifier]) {
+            // Create an LSApplicationProxy instance for each custom app the mapping defines
+            for (NSString *customAppIdentifier in impersonationMappings[applicationIdentifier]) {
+                id customApplication = [LSApplicationProxy applicationProxyForIdentifier:customAppIdentifier];
+                // Confirm its installed
+                if ([customApplication localizedName]) {
+                    [availableApplications addObject:customApplication];
+                }
+            }
         }
-    }];
-    return newApps;
+    }
+
+    return [availableApplications copy];     
 }
+
+%new - (id)appMimicMap {
+    
+    return [[self breezyPreferences] objectForKey:@"appMimicMap"];
+}
+
+%new - (id)breezyPreferences {
+    id bp = objc_getAssociatedObject(self, @selector(breezyPreferences));
+    if (bp == nil){
+        [[NSBundle bundleWithPath:@"/System/Library/Frameworks/TVServices.framework/"] load];
+        bp = [%c(TVSPreferences) preferencesWithDomain:@"com.nito.Breezy"];
+        objc_setAssociatedObject(self, @selector(breezyPreferences), bp, OBJC_ASSOCIATION_RETAIN);
+    }
+    return bp;
+}
+
+%new -(void)setupPreferences {
+    
+    //dlopen("/System/Library/Frameworks/TVServices.framework/TVServices", RTLD_NOW);
+    [[NSBundle bundleWithPath:@"/System/Library/Frameworks/TVServices.framework/"] load];
+    id prefs = [%c(TVSPreferences) preferencesWithDomain:@"com.nito.Breezy"];
+    BOOL airdropServerState = [prefs boolForKey:@"airdropServerState"];
+    NSLog(@"[Breezy] airdropServerState: %i", airdropServerState);
+}
+
+%end
+
+%hook PBAppDelegate
 
 %new - (void)showSystemAlertFromAlert:(id)alert
 {
@@ -378,8 +433,6 @@ static BOOL isPayloadBlessed(NSDictionary *payload, NSString *expectedEntitlemen
         NSArray <NSDictionary *> *files = userInfo[@"Files"];
         NSArray <NSString *> *localFiles = userInfo[@"LocalFiles"];
         NSArray <NSString *> *URLS = userInfo[@"URLS"];
-        __block NSMutableString *names = [NSMutableString new];
-        __block id doxy = nil;
 
         // If the alert is cancelled or no compatible apps are installed, this handler will delete the airdropped files
         void (^cleanupFiles)(void) = ^void(void) {
@@ -389,127 +442,145 @@ static BOOL isPayloadBlessed(NSDictionary *payload, NSString *expectedEntitlemen
             }
         };
 
-        //TODO: this could smarter, its possible the files selected dont all work in one app, need to accomodate that
-        __block BOOL hasIPA = FALSE; //kinda of a hacky check to make sure IPA's go through ReProvision if its avail.
-        [files enumerateObjectsUsingBlock:^(NSDictionary  * adFile, NSUInteger idx, BOOL * _Nonnull stop) {
+        // EA: There may be multiple files, urls, or both files AND urls provided in the transfer.
+        // For every item, determine if there are installed applications that can open it.
+        // * if 1 file is provided and no applications can open it, present an error
+        // * if 1 file is provided and 1 applications can open it, auto open it
+        // * if 1 file is provided and multiple applications can open it, present alert asking which app
+        // * if multiple files are provided and no applications can handle either of them, present an error
+        // * if multiple files are provided and they can both be opened by the same application, and no other apps can open them, open them in that app
+        // * if multiple files are provided and they each can be opened by multiple apps, but they have 1 app in common, open it in the common app
+        // * if multiple files are provided and they each can be opened by multiple apps, and they have multiple apps in common, present alert asking which app
+        // * if multiple files are provided and they each can be opened by multiple apps, but they dont have a common app, present an error
+        // * if multiple files are provided and and 1 can be opened but 1 cannot, ???
+        NSMutableDictionary *supportedAppsForItem = [[NSMutableDictionary alloc] init];
+        for (NSDictionary *adFile in files) {
+            // Determine which applications (if any) can open each provided file
             NSString *fileName = adFile[@"FileName"];
             NSString *fileType = adFile[@"FileType"];
-            if ([[[fileType pathExtension] lowercaseString] isEqualToString:@"ipa"] || [[[fileName pathExtension] lowercaseString] isEqualToString:@"ipa"]){
-                hasIPA = TRUE;
-            }
-            //h4x, we are only creating doxy if it doesnt already exist, so that means we are only taking into account the file type of the first file in the list.
-            if (!doxy) {
-                doxy = [LSDocumentProxy documentProxyForName:fileName type:fileType MIMEType:nil];
-            }
-            // Add comma if there are more files after this one
-            [names appendString:fileName];
-            if (idx < [files count] - 1) {
-                [names appendString:@", "];
-            }
-        }];
-   
-        NSString *appList = names;
-        if (names.length > 400){
-            appList = [NSString stringWithFormat:@"%@...", [names substringToIndex:400]];
-        }
-        [applicationAlert setText:[NSString stringWithFormat:@"Open \"%@\" with...", appList]];
 
-        NSArray *applications = [ws applicationsAvailableForOpeningDocument:doxy];
-        //NSPredicate *pred = [NSPredicate predicateWithFormat:@"bundleIdentifier != 'com.nito.nitoTV4'"];
-        //applications = [applications filteredArrayUsingPredicate: pred];
-        if (URLS.count > 0){ //we take a different path here
-            NSString *firstURL = URLS[0];
-            [names appendString:firstURL];
-            NSString *scheme = [[NSURL URLWithString:firstURL] scheme];
+            id documentProxy = [LSDocumentProxy documentProxyForName:fileName type:fileType MIMEType:nil];
+            NSArray *supportedAppIdentifiers = [[ws applicationsAvailableForOpeningDocument:documentProxy] valueForKey:@"_bundleIdentifier"];
+            supportedAppsForItem[fileName] = supportedAppIdentifiers;
+        }
+
+        // Same thing for urls.
+        // An application may support opening a url and file at the same time
+        for (NSString *url in URLS) {
+            // Determine which applications (if any) can open each provided scheme
+            NSString *scheme = [[NSURL URLWithString:url] scheme];
             NSLog(@"[Breezy] scheme: %@", scheme);
-            applications = [ws applicationsAvailableForHandlingURLScheme:[[NSURL URLWithString:firstURL] scheme]];
+            NSArray *supportedApps = [ws applicationsAvailableForHandlingURLScheme:scheme];
             //PBLinkHandler is useless and we dont want to list it as an option.
             NSPredicate *pred = [NSPredicate predicateWithFormat:@"bundleIdentifier != 'com.apple.PBLinkHandler'"];
-            applications = [applications filteredArrayUsingPredicate: pred];
+            supportedApps = [supportedApps filteredArrayUsingPredicate: pred];
+            supportedAppsForItem[url] = [supportedApps valueForKey:@"_bundleIdentifier"];
         }
 
-        // create the alert, we may not end up using it if theres only one application
-        NSLog(@"[Breezy] available applications: %@", applications);
-        NSString *cancelButtonTitle = @"Cancel";
-        //let applications mimic one another to easily add AirDrop support
-
-        // EA: not sure if intentional, but when VLC is not installed, this ends up adding a VLC app entry to the 
-        // applications array. That causes this alert to contain multiple buttons (because there is multiple apps),
-        // with a blank button representing the phantom VLC app.
-        // I'll work around it by ignoring apps that dont have a localizedName
-        applications = [self updatedApplicationsWithMimes:applications];
-        NSMutableArray *realApplications = [[NSMutableArray alloc] init];
-        for (id application in applications) {
-            if ([application localizedName] != nil) {
-                [realApplications addObject:application];
+        // What should we call these items?
+        NSString *itemName = @"item";
+        if ([files count] > 0) {
+            if ([URLS count] == 0) {
+                // All files and no urls - refer to the item as a file
+                itemName = @"file";
             }
         }
-        applications = [realApplications copy];
-        
-        //this is to work around old bug that may or may not still be present for ReProvision not registering
-        //for IPA support properly.
-        
-        if (applications.count == 0){
-            if (hasIPA){
-                NSLog(@"[Breezy] no applications and its an IPA file, check for ReProvision!");
-                id reproCheck = [LSApplicationProxy applicationProxyForIdentifier:@"com.matchstic.reprovision.tvos"];
-                if (reproCheck && [reproCheck localizedName]){
-                    NSLog(@"[Breezy] found ReProvision: %@", reproCheck );
-                    applications = @[reproCheck];
-                }
+        else {
+            if ([URLS count] > 0) {
+                // Call it a link
+                itemName = @"link";
             }
         }
-        if (applications.count == 1){ //Theres only one application, just open it automatically
-            id launchApp = applications[0];
-                if (URLS.count > 0){
-                    //process URLs
-                    [self openItems:URLS ofType:KBBreezyFileTypeLink withApplication:launchApp];
-                } else {
-                    //process files
-                    [self openItems:localFiles ofType:KBBreezyFileTypeLocal withApplication:launchApp];
-                }
-                // Make sure the entire airdrop container is cleaned up, not just the transferred files
-                cleanupFiles();
-            return; //returning here because we dont want to show a dialog, we are done.
-        } else if (applications.count > 1){  //multiple applications available, build up the menu
+        NSLog(@"%@", supportedAppsForItem);
 
-            [applications enumerateObjectsUsingBlock:^(id  _Nonnull currentApp, NSUInteger idx, BOOL * _Nonnull stop) {
-                [applicationAlert addButtonWithTitle:[currentApp localizedName] type:0 handler:^{
+        NSArray *allAppCandidates = [supportedAppsForItem allValues];
+        NSArray *supportedApplications = @[];
+        if ([allAppCandidates count] > 0) {
+            // Find apps that support all of the provided files
+            NSMutableSet *appCandidates = [NSMutableSet setWithArray:allAppCandidates[0]];
+            for (int i = 1; i < [allAppCandidates count]; i++) {
+                NSSet *applications = [NSSet setWithArray:allAppCandidates[i]];
+                [appCandidates intersectSet:applications];
+            }
+            supportedApplications = [appCandidates allObjects];
+        }
+
+        // Build a string containing comma-seperated item names
+        NSArray *allItems = [[files valueForKey:@"FileName"] arrayByAddingObjectsFromArray:URLS];
+        NSString *itemNames = [allItems componentsJoinedByString:@", "];
+        if (itemNames.length > 400) {
+            itemNames = [NSString stringWithFormat:@"%@...", [itemNames substringToIndex:400]];
+        }
+
+        // Build a block that handles opening the airdropped files
+        void (^openAirdroppedFiles)(NSString *) = ^void(NSString *appIdentifier) {
+            id launchApp = [LSApplicationProxy applicationProxyForIdentifier:appIdentifier];
+            if (URLS.count > 0) {
+                //process URLs
+                [self openItems:URLS ofType:KBBreezyFileTypeLink withApplication:launchApp];
+            } else {
+                //process files
+                [self openItems:localFiles ofType:KBBreezyFileTypeLocal withApplication:launchApp];
+            }
+            // Make sure the entire airdrop container is cleaned up, not just the transferred files
+            cleanupFiles();
+        };
+
+        NSString *alertBodyText = nil;
+        NSString *cancelButtonTitle = nil;
+        if ([supportedApplications count] == 0) {
+            // No apps support opening the files
+            if ([files count] == 1) {
+                // No apps can open the provided file
+                alertBodyText = [NSString stringWithFormat:@"No applications support opening \"%@\".", itemNames];
+            }
+            else {
+                NSMutableArray *flattenedIdentifiers = [[NSMutableArray alloc] init];
+                for (NSArray *identifiers in allAppCandidates) {
+                    [flattenedIdentifiers addObjectsFromArray:identifiers];
+                }
+                if ([flattenedIdentifiers count] > 0) {
+                    // Some files could be opened, but there isn't an app that supports every provided file
+                    alertBodyText = [NSString stringWithFormat:@"No single application supports opening all of the provided %@s.", itemName];
+                }
+                else {
+                    // None of the provided files had an app that supports them
+                    alertBodyText = [NSString stringWithFormat:@"No application supports opening the provided %@.", itemName];
+                }
+            }
+            cancelButtonTitle = @"OK";
+        }
+        else if ([supportedApplications count] == 1) {
+            // Only 1 app supports these files; auto open it without showing an alert
+            openAirdroppedFiles(supportedApplications[0]);
+            return;
+        }
+        else {
+            // The files can be opened my multiple apps
+            alertBodyText = [NSString stringWithFormat:@"Open \"%@\" with...", itemNames];
+            cancelButtonTitle = @"Cancel";
+            for (NSString *applicationIdentifier in supportedApplications) {
+                // Create a button for each app
+                id application = [LSApplicationProxy applicationProxyForIdentifier:applicationIdentifier];
+                [applicationAlert addButtonWithTitle:[application localizedName] type:0 handler:^{
                     
                     dismissAlert();
-
-                    if (URLS.count > 0){
-                        //process URLs
-                        [self openItems:URLS ofType:KBBreezyFileTypeLink withApplication:currentApp];
-                    } else {
-                        //process files
-                        [self openItems:localFiles ofType:KBBreezyFileTypeLocal withApplication:currentApp];
-                    }
-                    cleanupFiles();
-                    // dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-                    //     //leaving this here in case any of our processing actually needs to be in here..
-                    // });
+                    openAirdroppedFiles(applicationIdentifier);
                 }];
-            }];
-        } else { //no applications found
-            cancelButtonTitle = @"OK";
-            NSLog(@"no applications found to open these file(s)");
-            NSString *newMessage = [NSString stringWithFormat:@"Failed to find any applications to open \"%@\" with", names];
-            [applicationAlert setText:newMessage];
-
-            cleanupFiles();
+            }
         }
 
+        [applicationAlert setText:alertBodyText];   
+
+        NSLog(@"[Breezy] available applications: %@", supportedApplications);
+        // Build the dismiss button
         [applicationAlert addButtonWithTitle:cancelButtonTitle type:0 handler:^{
-            
             dismissAlert();
             cleanupFiles();
         }];
         
         //done all our processing, time to show the alert!
         presentAlert();
-
-        HBLogDebug(@"file: %@ of type: %@ can open in the following applications: %@",fileName, fileType, applications);
     }
 }
 
@@ -522,7 +593,7 @@ static BOOL isPayloadBlessed(NSDictionary *payload, NSString *expectedEntitlemen
     id notificationCenter = [NSDistributedNotificationCenter defaultCenter];
     [notificationCenter addObserver:self  selector:@selector(showSystemAlertFromAlert:) name:KBBreezyAirdropPresentAlert object:nil];
 
-    [self setupPreferences];
+    ((void (*)(id, SEL))objc_msgSend)([LSApplicationWorkspace defaultWorkspace], NSSelectorFromString(@"setupPreferences"));
     return orig;
     
 }
@@ -579,30 +650,6 @@ static BOOL isPayloadBlessed(NSDictionary *payload, NSString *expectedEntitlemen
         }
     }
     return inputFile;
-}
-
-%new - (id)appMimicMap {
-    
-    return [[self breezyPreferences] objectForKey:@"appMimicMap"];
-}
-
-%new - (id)breezyPreferences {
-    id bp = objc_getAssociatedObject(self, @selector(breezyPreferences));
-    if (bp == nil){
-        [[NSBundle bundleWithPath:@"/System/Library/Frameworks/TVServices.framework/"] load];
-        bp = [%c(TVSPreferences) preferencesWithDomain:@"com.nito.Breezy"];
-        objc_setAssociatedObject(self, @selector(breezyPreferences), bp, OBJC_ASSOCIATION_RETAIN);
-    }
-    return bp;
-}
-
-%new -(void)setupPreferences {
-    
-    //dlopen("/System/Library/Frameworks/TVServices.framework/TVServices", RTLD_NOW);
-    [[NSBundle bundleWithPath:@"/System/Library/Frameworks/TVServices.framework/"] load];
-    id prefs = [%c(TVSPreferences) preferencesWithDomain:@"com.nito.Breezy"];
-    BOOL airdropServerState = [prefs boolForKey:@"airdropServerState"];
-    NSLog(@"[Breezy] airdropServerState: %i", airdropServerState);
 }
 
 /*

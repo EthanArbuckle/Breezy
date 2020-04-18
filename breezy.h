@@ -32,10 +32,6 @@ extern "C" CFStringRef UTTypeCreatePreferredIdentifierForTag(CFStringRef inTagCl
 - (void)openItems:(NSArray *)items ofType:(KBBreezyFileType)fileType withApplication:(id)proxy;
 - (NSURL *)inboxForIdentifier:(NSString *)identifier;
 - (NSString *)importFile:(NSString *)inputFile withApp:(id)proxy;
-- (void)setupPreferences;
-- (id)breezyPreferences;
-- (id)appMimicMap;
-- (NSArray *)updatedApplicationsWithMimes:(NSArray *)original;
 @end
 
 extern id __LSGetInboxURLForAppIdentifier(id);
@@ -131,6 +127,9 @@ extern NSString * const FBSOpenApplicationOptionKeyPayloadOptions; //@"__Payload
 -(BOOL)openApplicationWithBundleID:(id)arg1;
 -(id)operationToOpenResource:(id)arg1 usingApplication:(id)arg2 uniqueDocumentIdentifier:(id)arg3 isContentManaged:(BOOL)arg4 sourceAuditToken:(id)arg5 userInfo:(id)arg6 options:(id)arg7 delegate:(id)arg8;
 -(BOOL)openURL:(id)arg1 withOptions:(id)arg2;
+- (void)setupPreferences;
+- (id)breezyPreferences;
+- (id)appMimicMap;
 @end
 @interface NSProgress (science)
 - (BOOL)isFinished;
