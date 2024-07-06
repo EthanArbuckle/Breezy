@@ -188,7 +188,17 @@ static BOOL isPayloadBlessed(NSDictionary *payload, NSString *expectedEntitlemen
             
             // The container for the transferred files. In some scenarios, PineBoard will be responsible for
             // cleaning this up.
-            NSURL *containerLocation = ((NSURL * (*)(id, SEL, id))objc_msgSend)(self, NSSelectorFromString(@"transferURLForTransfer:"), transfer);
+            NSURL *containerLocation = nil;
+            SEL transferURLForTransferSel = NSSelectorFromString(@"transferURLForTransfer:");
+            if ([(id)self respondsToSelector:transferURLForTransferSel]) {
+                containerLocation = ((NSURL * (*)(id, SEL, id))objc_msgSend)(self, transferURLForTransferSel, transfer);
+            }
+            else if ([objc_getClass("SDAirDropHandler") respondsToSelector:transferURLForTransferSel]) {
+                containerLocation = ((NSURL * (*)(id, SEL, id))objc_msgSend)(objc_getClass("SDAirDropHandler"), transferURLForTransferSel, transfer);
+            }
+            else {
+                [NSException raise:@"Breezy" format:@"Failed to get transfer container location. Transfer: %@", transfer];
+            }
 
             NSMutableDictionary *sent = [NSMutableDictionary new];
             sent[@"Files"] = arg[@"Files"];
@@ -248,6 +258,8 @@ static BOOL isPayloadBlessed(NSDictionary *payload, NSString *expectedEntitlemen
 %end //Sharingd Group
 
 %group PineBoard
+
+static int pineboard_applicationDidFinishLaunching_called = 0;
 
 %hook PBAppDelegate
 
@@ -566,16 +578,22 @@ static BOOL isPayloadBlessed(NSDictionary *payload, NSString *expectedEntitlemen
     }
 }
 
+static void pineboard_setup_breezy(void) {
+    // still need to get rid of this ugly eyesore
+    [[NSDistributedNotificationCenter defaultCenter] addObserver:[%c(PBAppDelegate) sharedInstance] selector:@selector(showSystemAlertFromAlert:) name:KBBreezyAirdropPresentAlert object:nil];
+    [[%c(PBAppDelegate) sharedInstance] setupPreferences];
+}
+
 - (_Bool)application:(id)arg1 didFinishLaunchingWithOptions:(id)arg2 {
     
     _Bool orig = %orig;
     %log;
     
-    // still need to get rid of this ugly eyesore
-    id notificationCenter = [NSDistributedNotificationCenter defaultCenter];
-    [notificationCenter addObserver:self  selector:@selector(showSystemAlertFromAlert:) name:KBBreezyAirdropPresentAlert object:nil];
+    if (pineboard_applicationDidFinishLaunching_called == 0) {
+        pineboard_applicationDidFinishLaunching_called = 1;
+        pineboard_setup_breezy();
+    }
 
-    [self setupPreferences];
     return orig;
     
 }
@@ -739,6 +757,18 @@ static BOOL isPayloadBlessed(NSDictionary *payload, NSString *expectedEntitlemen
     //NSLog(@"Process name: %@", processName);
     if ([processName isEqualToString:@"PineBoard"]){
         %init(PineBoard);
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            // If the dylib is injected into Pineboard after it's already launched, the applicationDidFinishLaunching
+            // hook won't be called. To cover this scenario, wait a few seconds after injection then check if the hook
+            // has been called. If it has not been called, explicitly call the setup function
+            if (pineboard_applicationDidFinishLaunching_called == 0) {
+                pineboard_setup_breezy();
+
+                // Make sure the setup function is not called again
+                pineboard_applicationDidFinishLaunching_called = 1;
+            }
+        });
 
     } else if ([processName isEqualToString:@"sharingd"]){
         %init(Sharingd);
