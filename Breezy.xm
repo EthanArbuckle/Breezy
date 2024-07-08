@@ -259,8 +259,6 @@ static BOOL isPayloadBlessed(NSDictionary *payload, NSString *expectedEntitlemen
 
 %group PineBoard
 
-static int pineboard_applicationDidFinishLaunching_called = 0;
-
 %hook PBAppDelegate
 
 /*
@@ -302,6 +300,10 @@ static int pineboard_applicationDidFinishLaunching_called = 0;
     return newApps;
 }
 
+static void present_alert_for_tvOS18(NSDictionary *alertPayload, NSString *alertContext) {
+    NSLog(@"Breezy: UI Alerts are currently broken on tvOS 18");
+}
+
 %new - (void)showSystemAlertFromAlert:(id)alert
 {
     %log;
@@ -315,6 +317,13 @@ static int pineboard_applicationDidFinishLaunching_called = 0;
 
     // Only sharingd is expected to communicate
     if (!isPayloadBlessed(payload, @"com.apple.sharing.RemoteInteractionSession")) {
+        return;
+    }
+
+    // tvOS18 significantly changed how alerts are created. We need to use PBTextEntryViewController to build the alert.
+    // PBDialogManager will still handle the presentation of it
+    if (kCFCoreFoundationVersionNumber >= 3031.1) {
+        present_alert_for_tvOS18(payload, alertContext);
         return;
     }
 
@@ -578,21 +587,14 @@ static int pineboard_applicationDidFinishLaunching_called = 0;
     }
 }
 
-static void pineboard_setup_breezy(void) {
-    // still need to get rid of this ugly eyesore
-    [[NSDistributedNotificationCenter defaultCenter] addObserver:[%c(PBAppDelegate) sharedInstance] selector:@selector(showSystemAlertFromAlert:) name:KBBreezyAirdropPresentAlert object:nil];
-    [[%c(PBAppDelegate) sharedInstance] setupPreferences];
-}
-
 - (_Bool)application:(id)arg1 didFinishLaunchingWithOptions:(id)arg2 {
     
     _Bool orig = %orig;
     %log;
     
-    if (pineboard_applicationDidFinishLaunching_called == 0) {
-        pineboard_applicationDidFinishLaunching_called = 1;
-        pineboard_setup_breezy();
-    }
+    id sharedInstance = self;
+    [[NSDistributedNotificationCenter defaultCenter] addObserver:sharedInstance selector:@selector(showSystemAlertFromAlert:) name:KBBreezyAirdropPresentAlert object:nil];
+    [sharedInstance setupPreferences];
 
     return orig;
     
@@ -757,18 +759,6 @@ static void pineboard_setup_breezy(void) {
     //NSLog(@"Process name: %@", processName);
     if ([processName isEqualToString:@"PineBoard"]){
         %init(PineBoard);
-
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-            // If the dylib is injected into Pineboard after it's already launched, the applicationDidFinishLaunching
-            // hook won't be called. To cover this scenario, wait a few seconds after injection then check if the hook
-            // has been called. If it has not been called, explicitly call the setup function
-            if (pineboard_applicationDidFinishLaunching_called == 0) {
-                pineboard_setup_breezy();
-
-                // Make sure the setup function is not called again
-                pineboard_applicationDidFinishLaunching_called = 1;
-            }
-        });
 
     } else if ([processName isEqualToString:@"sharingd"]){
         %init(Sharingd);
